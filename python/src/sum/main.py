@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import signal
 import threading
 
 from common import fruit_item, message_protocol, middleware
@@ -113,6 +114,16 @@ class SumFilter:
             return
         ack()
 
+    def stop(self):
+        logging.info("Stopping Sum filter")
+        self.input_queue.stop_consuming()
+        self.sum_control_consumer.stop_consuming()
+        for exchange in self.data_output_exchanges:
+            exchange.close()
+        self.input_queue.close()
+        self.sum_control_consumer.close()
+        self.sum_control_publisher.close()
+
     def start(self):
         threads = [
             threading.Thread(
@@ -133,6 +144,12 @@ class SumFilter:
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
+
+    def handle_sigterm(signum, frame):
+        logging.info("Received SIGTERM signal")
+        sum_filter.stop()
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
     sum_filter.start()
     return 0
 
