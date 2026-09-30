@@ -1,8 +1,8 @@
-import os
-import logging
 import bisect
+import logging
+import os
 
-from common import middleware, message_protocol, fruit_item
+from common import fruit_item, message_protocol, middleware
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
@@ -16,8 +16,8 @@ TOP_SIZE = int(os.environ["TOP_SIZE"])
 MESSAGE_FIELDS = 3
 EOF_FIELDS = 1
 
-class AggregationFilter:
 
+class AggregationFilter:
     def __init__(self):
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
@@ -26,32 +26,47 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.fruit_tops = {}
+        self.eof_counts = {}
 
     def _process_data(self, client_id, fruit, amount):
-        logging.info(f"Processing data message: client_id={client_id}, fruit={fruit}, amount={amount}")
+        logging.info(
+            f"Processing data message: client_id={client_id}, fruit={fruit}, amount={amount}"
+        )
         fruit_top = self.fruit_tops.get(client_id, [])
         for i in range(len(fruit_top)):
             if fruit_top[i].fruit == fruit:
-                fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
-                self.fruit_tops[client_id] = fruit_top
+                fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(fruit, amount)
+                # NOTE: Timsort is optimized for near sorted lists, so this should be efficient.
+                self.fruit_tops[client_id] = sorted(fruit_top)
                 return
         bisect.insort(fruit_top, fruit_item.FruitItem(fruit, amount))
         self.fruit_tops[client_id] = fruit_top
 
     def _process_eof(self, client_id):
-        logging.info(f"Received EOF: {client_id}")
+        current_count = self.eof_counts.get(client_id, 0) + 1
+        self.eof_counts[client_id] = current_count
+
+        logging.info(
+            f"Received EOF for client_id={client_id}. Count={current_count}/{SUM_AMOUNT}"
+        )
+
+        if current_count < SUM_AMOUNT:
+            return
+        logging.info(
+            f"All EOF messages received for client_id={client_id}. Finalizing top items. {[str(fruit) for fruit in self.fruit_tops.get(client_id)]}"
+        )
         fruit_chunk = list(self.fruit_tops.get(client_id, [])[-TOP_SIZE:])
         fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
+        fruit_top = [
+            (fruit_item.fruit, fruit_item.amount) for fruit_item in fruit_chunk
+        ]
+
+        self.output_queue.send(
+            message_protocol.internal.serialize([client_id] + fruit_top)
         )
-        self.output_queue.send(message_protocol.internal.serialize([client_id] + fruit_top))
-        self.fruit_tops.pop(client_id)
+
+        self.fruit_tops.pop(client_id, None)
+        self.eof_counts.pop(client_id, None)
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")

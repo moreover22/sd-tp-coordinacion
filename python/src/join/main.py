@@ -1,7 +1,7 @@
-import os
 import logging
+import os
 
-from common import middleware, message_protocol, fruit_item
+from common import fruit_item, message_protocol, middleware
 
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
@@ -22,11 +22,53 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self.partial_counts = {}
+        self.partial_totals = {}
+
+    def _merge_partial_top(self, client_id, partial_top_items):
+        running = self.partial_totals.setdefault(client_id, {})
+        for fruit, amount in partial_top_items:
+            current = running.get(fruit, 0)
+            running[fruit] = current + int(amount)
+
+    def _finalize_client(self, client_id):
+        merged = self.partial_totals.get(client_id, {})
+        fruit_items = [
+            fruit_item.FruitItem(fruit, amount)
+            for fruit, amount in merged.items()
+        ]
+        fruit_items.sort(reverse=True)
+
+        final_top = fruit_items[:TOP_SIZE]
+        payload = [client_id]
+        for fruit_item_instance in final_top:
+            payload.append([fruit_item_instance.fruit, fruit_item_instance.amount])
+
+        self.output_queue.send(message_protocol.internal.serialize(payload))
+        self.partial_counts.pop(client_id, None)
+        self.partial_totals.pop(client_id, None)
 
     def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+        fields = message_protocol.internal.deserialize(message)
+
+        if not fields:
+            logging.info("Received empty message, ignoring")
+            ack()
+            return
+
+        client_id, *partial_top = fields
+
+        if not partial_top:
+            ack()
+            return
+
+        logging.info(f"Received partial top for client_id={client_id}: {partial_top}")
+        self.partial_counts[client_id] = self.partial_counts.get(client_id, 0) + 1
+        self._merge_partial_top(client_id, partial_top)
+
+        if self.partial_counts[client_id] >= AGGREGATION_AMOUNT:
+            self._finalize_client(client_id)
+
         ack()
 
     def start(self):
