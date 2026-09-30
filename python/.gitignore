@@ -1,0 +1,5 @@
+docker-compose.yaml
+scenarios/*
+output/*
+*.pyc
+__pycache__/
